@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Graph;
 using StowellCoAPI.DTO;
 using StowellCoAPI.Models;
@@ -17,9 +18,14 @@ namespace StowellCoAPI.Controllers
         private readonly ILogger<SecurityGroupController> _logger;
         private readonly IConfiguration _configuration;
         private readonly GraphServiceClient _graphServiceClient;
+        private readonly IMemoryCache _cache;
+        // The directory changes rarely and Graph is slow, so results are kept for a while
+        private static readonly TimeSpan CacheFor = TimeSpan.FromMinutes(30);
+        private const string UserFields = "id,displayName,jobTitle,city,state,zip,businessPhones,mobilePhone,mail,officeLocation,companyName,postalCode,streetAddress,onPremisesExtensionAttributes";
 
-        public SecurityGroupController(ILogger<SecurityGroupController> logger, IConfiguration configuration,GraphServiceClient graphServiceClient)
+        public SecurityGroupController(ILogger<SecurityGroupController> logger, IConfiguration configuration,GraphServiceClient graphServiceClient, IMemoryCache cache)
         {
+            _cache = cache;
             _configuration = configuration;
              _graphServiceClient = graphServiceClient;
             _logger = logger;
@@ -30,7 +36,11 @@ namespace StowellCoAPI.Controllers
         {
             try
             {
-                
+                if (_cache.TryGetValue("contacts:groups", out List<ContactGroups>? cachedGroups) && cachedGroups != null)
+                {
+                    return Ok(cachedGroups);
+                }
+
                 var userList = new List<ContactGroups>();
 
                 // Fetch all users with pagination
@@ -54,6 +64,7 @@ namespace StowellCoAPI.Controllers
                             null;
                 }
                 
+                _cache.Set("contacts:groups", userList, CacheFor);
                 return Ok(userList);
             }
             catch (SqlException sqlEx)
@@ -163,68 +174,26 @@ namespace StowellCoAPI.Controllers
         {
             try
             {
-                var groupMembers = new List<ContactGroupMembers>();
-
-                // Request to get members of the group
-                var members = await _graphServiceClient.Groups[groupId].Members
-                    .Request()
-                    //.Select("id,displayName,jobTitle,officeLocation,companyName,mobilePhone,mail,onPremisesExtensionAttributes")
-                    .GetAsync();
-                foreach (var member in members.CurrentPage.OfType<User>())
+                if (_cache.TryGetValue($"contacts:group:{groupId}", out List<ContactGroupMembers>? cached) && cached != null)
                 {
-                    var fullUser = await _graphServiceClient.Users[member.Id]
-                        .Request()
-                        .Select("id,displayName,jobTitle,city,state,zip,businessPhones,mail,officeLocation,companyName,postalCode,streetAddress,onPremisesExtensionAttributes")
-                        .GetAsync();
-                    string? photoBase64 = null;
-                    try
-                    {
-                        byte[]? photoBytes;
-                        var photoStream = await _graphServiceClient.Users[member.Id]
-    .Photo
-    .Content
-    .Request()
-    .GetAsync();
-                       
-                        using (var ms = new MemoryStream())
-                        {
-                            await photoStream.CopyToAsync(ms);
-                            photoBytes = ms.ToArray();
-                        }
-                        // Convert photo bytes to base64 string (if available)
-                       
-                        if (photoBytes != null)
-                        {
-                            photoBase64 = Convert.ToBase64String(photoBytes);
-                        }
-                    }
-                    catch (ServiceException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound)
-                    {
-                        // Photo not found, leave photoBytes null
-                    }
-
-                    
-
-                    groupMembers.Add(new ContactGroupMembers
-                    {
-                        Id = fullUser.Id,
-                        DisplayName = fullUser.DisplayName,
-                        JobTitle = fullUser.JobTitle,
-                        City = fullUser.City,
-                        Mail = fullUser.Mail,
-                        StreetAddress = fullUser.StreetAddress,
-                        State = fullUser.State,
-                        PostalCode = fullUser.PostalCode,
-                        Location = fullUser.OfficeLocation,
-                        Company = fullUser.CompanyName,
-                        Phone = fullUser.BusinessPhones.Any() ? fullUser.BusinessPhones.FirstOrDefault() : fullUser.MobilePhone,
-                        AddressLine1 = fullUser.OnPremisesExtensionAttributes?.ExtensionAttribute1,
-                        AddressLine2 = fullUser.OnPremisesExtensionAttributes?.ExtensionAttribute2,
-                        PhotoBase64=photoBase64
-                    });
-
+                    return Ok(cached);
                 }
 
+                var users = new List<User>();
+                var members = await _graphServiceClient.Groups[groupId].Members
+                    .Request()
+                    .Select(UserFields)
+                    .GetAsync();
+                while (members != null)
+                {
+                    users.AddRange(members.CurrentPage.OfType<User>());
+                    members = members.NextPageRequest != null ? await members.NextPageRequest.GetAsync() : null;
+                }
+
+                // photos are not part of this reply, so the list shows at once; the page asks for each one (UserPhoto)
+                var groupMembers = users.Select(ToContact).OrderBy(m => m.DisplayName).ToList();
+
+                _cache.Set($"contacts:group:{groupId}", groupMembers, CacheFor);
                 return Ok(groupMembers);
             }
             catch (SqlException sqlEx)
@@ -249,6 +218,53 @@ namespace StowellCoAPI.Controllers
             }
 
         }
+        private static ContactGroupMembers ToContact(User user)
+        {
+            return new ContactGroupMembers
+            {
+                Id = user.Id,
+                DisplayName = user.DisplayName,
+                JobTitle = user.JobTitle,
+                City = user.City,
+                Mail = user.Mail,
+                StreetAddress = user.StreetAddress,
+                State = user.State,
+                PostalCode = user.PostalCode,
+                Location = user.OfficeLocation,
+                Company = user.CompanyName,
+                Phone = user.BusinessPhones.Any() ? user.BusinessPhones.FirstOrDefault() : user.MobilePhone,
+                AddressLine1 = user.OnPremisesExtensionAttributes?.ExtensionAttribute1,
+                AddressLine2 = user.OnPremisesExtensionAttributes?.ExtensionAttribute2,
+                PhotoBase64 = null
+            };
+        }
+
+        /// <summary>A small profile photo (96x96), kept for an hour. 404 when the person has none.</summary>
+        [HttpGet("api/[controller]/UserPhoto/{userId}", Name = "UserPhoto")]
+        public async Task<IActionResult> GetUserPhoto(string userId)
+        {
+            var key = $"contacts:photo:{userId}";
+            if (!_cache.TryGetValue(key, out byte[]? bytes))
+            {
+                try
+                {
+                    var stream = await _graphServiceClient.Users[userId].Photos["96x96"].Content.Request().GetAsync();
+                    using var ms = new MemoryStream();
+                    await stream.CopyToAsync(ms);
+                    bytes = ms.ToArray();
+                }
+                catch (ServiceException)
+                {
+                    bytes = null;
+                }
+                _cache.Set(key, bytes, TimeSpan.FromHours(1));
+            }
+
+            if (bytes == null || bytes.Length == 0) return NotFound();
+            Response.Headers["Cache-Control"] = "private, max-age=3600";
+            return File(bytes, "image/jpeg");
+        }
+
         [HttpGet("api/[controller]/friend-photo/{email}", Name = "friend-photo")]
         private async Task<IActionResult> GetFriendPhotoAsync([FromQuery] string email)
         {

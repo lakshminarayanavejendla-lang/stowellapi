@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 using StowellCoAPI.DTO;
+using StowellCoAPI.Services;
 using System.Data;
 using System.Text.Json;
 
@@ -58,22 +59,24 @@ namespace StowellCoAPI.Controllers
             {
                 string connectionString = _configuration.GetConnectionString("SageSBQConnection");
                 using SqlConnection connection = new SqlConnection(connectionString);
-                SqlCommand command = new SqlCommand("CO_SubmitBudgetReallocation", connection) { CommandType = CommandType.StoredProcedure };
+                // Mike Smith, 2026-09-26: a submitted allocation (Prime or Internal) now waits for Accounting approval - nothing is posted to
+                // Sage yet. CO_SubmitAllocationForApproval holds it (dbo.CoAllocationApprovalRequests); ApproveRequest below runs the real
+                // CO_SubmitBudgetReallocation; RejectRequest drops it from the queue. Same parameters as CO_SubmitBudgetReallocation.
+                SqlCommand command = new SqlCommand("CO_SubmitAllocationForApproval", connection) { CommandType = CommandType.StoredProcedure };
                 command.Parameters.AddWithValue("@CoNumber", string.IsNullOrWhiteSpace(request.CoNumber) ? (object)DBNull.Value : request.CoNumber);
                 command.Parameters.AddWithValue("@ProfitOnSell", request.ProfitOnSell);
                 AddCommonParameters(command, request);
 
                 await connection.OpenAsync();
                 using SqlDataReader reader = await command.ExecuteReaderAsync();
-                string coNumber = null;
-                int allocationId = 0;
+                int requestId = 0;
                 if (await reader.ReadAsync())
                 {
-                    coNumber = reader["CoNumber"].ToString();
-                    allocationId = Convert.ToInt32(reader["AllocationId"]);
+                    requestId = Convert.ToInt32(reader["RequestId"]);
                 }
 
-                return Ok(new { submitted = true, coNumber, allocationId });
+                // coNumber / allocationId are assigned when Accounting approves the request
+                return Ok(new { submitted = true, requestId, status = "Pending Approval" });
             }
             catch (SqlException sqlEx)
             {
@@ -267,17 +270,39 @@ namespace StowellCoAPI.Controllers
             {
                 string connectionString = _configuration.GetConnectionString("SageSBQConnection");
                 using SqlConnection connection = new SqlConnection(connectionString);
+
+                // CHANGE (2026-10-04, "all should be through approval"): an allocation that is already posted to Sage
+                // ('Submitted') is no longer reversed on the spot - deleting it is saved as a Pending change request and
+                // Accounting approves it (Change_Approve then runs CO_DeleteBudgetReallocation). A draft was never posted,
+                // so it is still deleted straight away.
+                await connection.OpenAsync();
+                string currentStatus;
+                using (var statusCmd = new SqlCommand("SELECT Status FROM dbo.CoBudgetAllocations WHERE Id = @Id", connection))
+                {
+                    statusCmd.Parameters.AddWithValue("@Id", allocationId);
+                    currentStatus = (await statusCmd.ExecuteScalarAsync()) as string;
+                }
+                if (string.Equals(currentStatus, "Submitted", StringComparison.OrdinalIgnoreCase))
+                {
+                    var requestId = await ChangeRequestStore.RequestAsync(
+                        _configuration, ChangeRequestStore.CoAllocation, allocationId.ToString(), "Delete", null, deletedBy);
+                    return Ok(new { deleted = false, pendingApproval = true, requestId });
+                }
+
                 SqlCommand command = new SqlCommand("CO_DeleteBudgetReallocation", connection) { CommandType = CommandType.StoredProcedure };
                 command.Parameters.AddWithValue("@AllocationId", allocationId);
                 command.Parameters.AddWithValue("@DeletedBy", (object)deletedBy ?? DBNull.Value);
 
-                await connection.OpenAsync();
                 using SqlDataReader reader = await command.ExecuteReaderAsync();
                 string coNumber = null;
                 if (await reader.ReadAsync() && !reader.IsDBNull(reader.GetOrdinal("CoNumber")))
                     coNumber = reader["CoNumber"].ToString();
 
                 return Ok(new { deleted = true, coNumber });
+            }
+            catch (SqlException sqlEx) when (ChangeRequestStore.IsUserFacing(sqlEx))
+            {
+                return Conflict(new { Message = sqlEx.Message });
             }
             catch (SqlException sqlEx)
             {
@@ -359,6 +384,193 @@ namespace StowellCoAPI.Controllers
             {
                 _logger.LogError(ex, ex.Message);
                 return StatusCode(500, new { Message = "An unexpected error occurred while retrieving the CO budget allocation.", Details = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------------------------------------------------------------------
+        // Accounting approval of submitted allocations (Mike Smith, 2026-09-26) - see db/allocation-approval-2026-09-26.sql. Approve -> the
+        // allocation is posted to Sage exactly as Submit used to do; reject -> marked rejected and removed from the queue.
+        // ------------------------------------------------------------------------------------------------------------------------
+
+        /// <summary>Allocations waiting for Accounting approval (Prime and Internal) - the Accounting Queue.</summary>
+        [HttpGet("api/CoBudgetAllocation/ApprovalRequests/Pending", Name = "GetPendingCoBudgetAllocationApprovals")]
+        public async Task<IActionResult> GetPendingApprovals()
+        {
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("CO_GetPendingAllocationApprovals", connection) { CommandType = CommandType.StoredProcedure };
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+                var rows = new List<object>();
+                while (await reader.ReadAsync())
+                {
+                    rows.Add(new
+                    {
+                        requestId = Convert.ToInt32(reader["RequestId"]),
+                        coType = reader["CoType"].ToString(),
+                        jobId = reader["JobId"].ToString(),
+                        jobName = reader["JobName"] == DBNull.Value ? "" : reader["JobName"].ToString(),
+                        coDescription = reader["CoDescription"] == DBNull.Value ? "" : reader["CoDescription"].ToString(),
+                        coReason = reader["CoReason"] == DBNull.Value ? "" : reader["CoReason"].ToString(),
+                        createdBy = reader["CreatedBy"] == DBNull.Value ? "" : reader["CreatedBy"].ToString(),
+                        budgetChangeTotal = Convert.ToDecimal(reader["BudgetChangeTotal"]),
+                        submittedDate = Convert.ToDateTime(reader["SubmittedDate"]).ToString("MM/dd/yyyy", System.Globalization.CultureInfo.InvariantCulture)
+                    });
+                }
+                return Ok(rows);
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(500, new { Message = "A database error occurred while retrieving the allocations waiting for approval.", Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while retrieving the allocations waiting for approval.", Details = ex.Message });
+            }
+        }
+
+        /// <summary>One request for the approval screen, in the same shape as GetById so the allocation page can show it unchanged.</summary>
+        [HttpGet("api/CoBudgetAllocation/ApprovalRequests/{requestId}", Name = "GetCoBudgetAllocationApprovalRequest")]
+        public async Task<IActionResult> GetApprovalRequest(int requestId)
+        {
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("CO_GetAllocationApprovalRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", requestId);
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+
+                CoBudgetAllocationDetail detail = null;
+                if (await reader.ReadAsync())
+                {
+                    detail = new CoBudgetAllocationDetail
+                    {
+                        AllocationId = Convert.ToInt32(reader["AllocationId"]),
+                        CoNumber = reader.IsDBNull(reader.GetOrdinal("CoNumber")) ? string.Empty : reader["CoNumber"].ToString(),
+                        JobId = reader.IsDBNull(reader.GetOrdinal("JobId")) ? string.Empty : reader["JobId"].ToString(),
+                        JobName = reader.IsDBNull(reader.GetOrdinal("JobName")) ? string.Empty : reader["JobName"].ToString(),
+                        CoType = reader.IsDBNull(reader.GetOrdinal("CoType")) ? string.Empty : reader["CoType"].ToString(),
+                        CoDescription = reader.IsDBNull(reader.GetOrdinal("CoDescription")) ? string.Empty : reader["CoDescription"].ToString(),
+                        CoReason = reader.IsDBNull(reader.GetOrdinal("CoReason")) ? string.Empty : reader["CoReason"].ToString(),
+                        CoStatus = reader.IsDBNull(reader.GetOrdinal("CoStatus")) ? string.Empty : reader["CoStatus"].ToString(),
+                        OverallBudget = Convert.ToDecimal(reader["OverallBudget"]),
+                        BudgetChangeTotal = Convert.ToDecimal(reader["BudgetChangeTotal"]),
+                        ProfitOnSell = Convert.ToDecimal(reader["ProfitOnSell"]),
+                        RequestedAmount = reader.IsDBNull(reader.GetOrdinal("RequestedAmount")) ? null : Convert.ToDecimal(reader["RequestedAmount"]),
+                        ApprovedAmount = reader.IsDBNull(reader.GetOrdinal("ApprovedAmount")) ? null : Convert.ToDecimal(reader["ApprovedAmount"]),
+                        Status = reader.IsDBNull(reader.GetOrdinal("Status")) ? string.Empty : reader["Status"].ToString(),
+                        CreatedBy = reader.IsDBNull(reader.GetOrdinal("CreatedBy")) ? string.Empty : reader["CreatedBy"].ToString(),
+                        CreatedDate = Convert.ToDateTime(reader["CreatedDate"])
+                    };
+                }
+
+                if (detail == null) return NotFound(new { Message = $"Allocation request {requestId} not found." });
+
+                await reader.NextResultAsync();
+                while (await reader.ReadAsync())
+                {
+                    detail.Phases.Add(reader["Phase"].ToString());
+                }
+
+                await reader.NextResultAsync();
+                while (await reader.ReadAsync())
+                {
+                    detail.Lines.Add(new CoBudgetLineDto
+                    {
+                        CostCode = reader.IsDBNull(reader.GetOrdinal("CostCode")) ? string.Empty : reader["CostCode"].ToString(),
+                        CostCodeDescription = reader.IsDBNull(reader.GetOrdinal("CostCodeDescription")) ? string.Empty : reader["CostCodeDescription"].ToString(),
+                        Debit = Convert.ToDecimal(reader["Debit"]),
+                        Credit = Convert.ToDecimal(reader["Credit"])
+                    });
+                }
+
+                return Ok(detail);
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(500, new { Message = "A database error occurred while retrieving the allocation request.", Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while retrieving the allocation request.", Details = ex.Message });
+            }
+        }
+
+        public class CoAllocationApprovalActionDto
+        {
+            public int RequestId { get; set; }
+            /// <summary>required when rejecting; not sent when approving</summary>
+            public string? Reason { get; set; }
+            /// <summary>the signed-in Accounting user who decided</summary>
+            public string? DecidedBy { get; set; }
+        }
+
+        /// <summary>Approve: posts the allocation to Sage (the real submit) and marks the request Approved.</summary>
+        [HttpPost("api/CoBudgetAllocation/ApprovalRequests/Approve", Name = "ApproveCoBudgetAllocationRequest")]
+        public async Task<IActionResult> ApproveRequest([FromBody] CoAllocationApprovalActionDto request)
+        {
+            if (request == null || request.RequestId <= 0) return BadRequest(new { Message = "Invalid allocation request id." });
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("CO_ApproveAllocationRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", request.RequestId);
+                command.Parameters.AddWithValue("@ApprovedBy", (object)request.DecidedBy ?? DBNull.Value);
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+                string coNumber = null;
+                int allocationId = 0;
+                if (await reader.ReadAsync())
+                {
+                    coNumber = reader["CoNumber"].ToString();
+                    allocationId = Convert.ToInt32(reader["AllocationId"]);
+                }
+                return Ok(new { succeeded = true, coNumber, allocationId });
+            }
+            catch (SqlException sqlEx)
+            {
+                // business rules from the procedures (already decided, a cost code would go below zero ...) come back as readable messages
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(409, new { Message = sqlEx.Message, Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while approving the allocation.", Details = ex.Message });
+            }
+        }
+
+        /// <summary>Reject: marks the request Rejected (reason required) so it leaves the queue. Nothing is posted to Sage.</summary>
+        [HttpPost("api/CoBudgetAllocation/ApprovalRequests/Reject", Name = "RejectCoBudgetAllocationRequest")]
+        public async Task<IActionResult> RejectRequest([FromBody] CoAllocationApprovalActionDto request)
+        {
+            if (request == null || request.RequestId <= 0) return BadRequest(new { Message = "Invalid allocation request id." });
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("CO_RejectAllocationRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", request.RequestId);
+                command.Parameters.AddWithValue("@RejectedBy", (object)request.DecidedBy ?? DBNull.Value);
+                command.Parameters.AddWithValue("@Reason", (object)request.Reason ?? DBNull.Value);
+                await connection.OpenAsync();
+                await command.ExecuteNonQueryAsync();
+                return Ok(new { succeeded = true });
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(409, new { Message = sqlEx.Message, Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while rejecting the allocation.", Details = ex.Message });
             }
         }
 

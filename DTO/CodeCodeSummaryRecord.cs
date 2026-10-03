@@ -118,6 +118,8 @@ namespace StowellCoAPI.DTO
         public string Address { get; set; }
         public string CreatedBy { get; set; }
         public string Status { get; set; }
+        /// <summary>Percent complete (0-100) from actrec.pctcmp.</summary>
+        public decimal PercentComplete { get; set; }
     }
     public class CostCodeRecord
     {

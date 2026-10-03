@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 using StowellCoAPI.DTO;
+using StowellCoAPI.Services;
 using System.Data;
 using System.Globalization;
 using System.Text.Json;
@@ -203,7 +204,10 @@ namespace StowellCoAPI.Controllers
             {
                 string connectionString = _configuration.GetConnectionString("SageSBQConnection");
                 using SqlConnection connection = new SqlConnection(connectionString);
-                SqlCommand command = new SqlCommand("PO_SubmitRequest", connection) { CommandType = CommandType.StoredProcedure };
+                // Mike Smith, 2026-09-26: a submitted PO now waits for Accounting approval instead of being created in Sage straight away.
+                // PO_SubmitForApproval holds it (dbo.PoApprovalRequests); PO_ApproveRequest (ApprovePoRequest below) creates the Sage PO via
+                // PO_SubmitRequest, and PO_RejectRequest drops it from the queue. Same parameters as PO_SubmitRequest.
+                SqlCommand command = new SqlCommand("PO_SubmitForApproval", connection) { CommandType = CommandType.StoredProcedure };
                 command.Parameters.AddWithValue("@JobId", long.TryParse(request.JobId, out var jobId) ? jobId : 0);
                 command.Parameters.AddWithValue("@Vendor", (object)request.Vendor ?? DBNull.Value);
                 command.Parameters.AddWithValue("@PoDescription", (object)request.PoDescription ?? DBNull.Value);
@@ -220,15 +224,14 @@ namespace StowellCoAPI.Controllers
 
                 await connection.OpenAsync();
                 using SqlDataReader reader = await command.ExecuteReaderAsync();
-                string poId = null;
-                long poRecNum = 0;
+                int requestId = 0;
                 if (await reader.ReadAsync())
                 {
-                    poId = reader["PoId"].ToString();
-                    poRecNum = Convert.ToInt64(reader["PoRecNum"]);
+                    requestId = Convert.ToInt32(reader["RequestId"]);
                 }
 
-                return Ok(new { submitted = true, poId, poRecNum });
+                // poId stays empty until Accounting approves the request (that is when the Sage PO number is assigned)
+                return Ok(new { submitted = true, requestId, status = "Pending Approval" });
             }
             catch (SqlException sqlEx)
             {
@@ -239,6 +242,187 @@ namespace StowellCoAPI.Controllers
             {
                 _logger.LogError(ex, ex.Message);
                 return StatusCode(500, new { Message = "An unexpected error occurred while submitting the PO request.", Details = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------------------------------------------------------------------
+        // Accounting approval of submitted POs (Mike Smith, 2026-09-26): approve -> the PO is created in Sage; reject -> marked rejected
+        // and removed from the queue. See db/po-approval-2026-09-26.sql.
+        // ------------------------------------------------------------------------------------------------------------------------
+
+        /// <summary>POs waiting for Accounting approval (the Accounting PO Queue).</summary>
+        [HttpGet("api/PoQueue/GetPendingPoApprovals", Name = "GetPendingPoApprovals")]
+        public async Task<IActionResult> GetPendingPoApprovals()
+        {
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("PO_GetPendingApprovals", connection) { CommandType = CommandType.StoredProcedure };
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+                var rows = new List<object>();
+                while (await reader.ReadAsync())
+                {
+                    rows.Add(new
+                    {
+                        requestId = Convert.ToInt32(reader["RequestId"]),
+                        jobId = reader["JobId"].ToString(),
+                        jobName = reader["JobName"] == DBNull.Value ? "" : reader["JobName"].ToString(),
+                        vendor = reader["Vendor"].ToString(),
+                        poDescription = reader["PoDescription"].ToString(),
+                        requester = reader["Requester"] == DBNull.Value ? "" : reader["Requester"].ToString(),
+                        createdBy = reader["CreatedBy"] == DBNull.Value ? "" : reader["CreatedBy"].ToString(),
+                        phaseNumber = Convert.ToInt32(reader["PhaseNumber"]),
+                        totalAmount = Convert.ToDecimal(reader["TotalAmount"]),
+                        submittedDate = Convert.ToDateTime(reader["SubmittedDate"]).ToString("MM/dd/yyyy", CultureInfo.InvariantCulture)
+                    });
+                }
+                return Ok(rows);
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(500, new { Message = "A database error occurred while retrieving the POs waiting for approval.", Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while retrieving the POs waiting for approval.", Details = ex.Message });
+            }
+        }
+
+        /// <summary>One request for the approval screen. {requestId} is the approval request id (shown as the PO id on the screen).</summary>
+        [HttpGet("api/PoQueue/GetPoRequestForApproval/{requestId}", Name = "GetPoRequestForApproval")]
+        public async Task<IActionResult> GetPoRequestForApproval(int requestId)
+        {
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("PO_GetApprovalRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", requestId);
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+
+                if (!await reader.ReadAsync()) return NotFound(new { Message = "PO request not found." });
+
+                var poId = reader["RequestId"].ToString();
+                var jobId = reader["JobId"].ToString();
+                var jobName = reader["JobName"] == DBNull.Value ? "" : reader["JobName"].ToString();
+                var requester = reader["Requester"] == DBNull.Value ? "" : reader["Requester"].ToString();
+                var vendor = reader["Vendor"].ToString();
+                var poDescription = reader["PoDescription"].ToString();
+                var dateRequested = reader["DateRequested"] == DBNull.Value ? "" : reader["DateRequested"].ToString();
+                var requiredOnSite = reader["RequiredOnSite"] == DBNull.Value ? "" : reader["RequiredOnSite"].ToString();
+                var phaseNumber = Convert.ToInt32(reader["PhaseNumber"]);
+                var totalPoAmount = Convert.ToDecimal(reader["TotalAmount"]);
+                var status = reader["Status"].ToString();
+
+                var items = new List<object>();
+                await reader.NextResultAsync();
+                while (await reader.ReadAsync())
+                {
+                    items.Add(new
+                    {
+                        item = reader["Item"] == DBNull.Value ? "" : reader["Item"].ToString(),
+                        remainingBudget = reader["RemainingBudget"] == DBNull.Value ? 0m : Convert.ToDecimal(reader["RemainingBudget"]),
+                        itemCost = reader["ItemCost"] == DBNull.Value ? 0m : Convert.ToDecimal(reader["ItemCost"]),
+                        itemNote = reader["ItemNote"] == DBNull.Value ? "" : reader["ItemNote"].ToString(),
+                        costCode = reader["CostCode"] == DBNull.Value ? (decimal?)null : Convert.ToDecimal(reader["CostCode"])
+                    });
+                }
+
+                var backCharges = new List<object>();
+                await reader.NextResultAsync();
+                while (await reader.ReadAsync())
+                {
+                    backCharges.Add(new
+                    {
+                        vendor = reader["Vendor"] == DBNull.Value ? "" : reader["Vendor"].ToString(),
+                        percentCharge = reader["PercentCharge"] == DBNull.Value ? (decimal?)null : Convert.ToDecimal(reader["PercentCharge"]),
+                        dollarCharge = Convert.ToDecimal(reader["DollarCharge"]),
+                        reason = reader["Reason"] == DBNull.Value ? "" : reader["Reason"].ToString()
+                    });
+                }
+
+                return Ok(new { poId, jobId, jobName, requester, vendor, poDescription, dateRequested, requiredOnSite, phaseNumber, totalPoAmount, status, items, backCharges });
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(500, new { Message = "A database error occurred while retrieving the PO request.", Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while retrieving the PO request.", Details = ex.Message });
+            }
+        }
+
+        public class PoApprovalActionDto
+        {
+            /// <summary>the approval request id (the id shown as the PO id on the approval screen)</summary>
+            public string? PoId { get; set; }
+            /// <summary>required when rejecting; not sent when approving</summary>
+            public string? Reason { get; set; }
+            /// <summary>the signed-in Accounting user who decided</summary>
+            public string? DecidedBy { get; set; }
+        }
+
+        /// <summary>Approve: creates the PO in Sage and marks the request Approved.</summary>
+        [HttpPost("api/PoQueue/ApprovePoRequest", Name = "ApprovePoRequest")]
+        public async Task<IActionResult> ApprovePoRequest([FromBody] PoApprovalActionDto request)
+        {
+            if (request == null || !int.TryParse(request.PoId, out var requestId)) return BadRequest(new { Message = "Invalid PO request id." });
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("PO_ApproveRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", requestId);
+                command.Parameters.AddWithValue("@ApprovedBy", (object)request.DecidedBy ?? DBNull.Value);
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+                string poId = null;
+                if (await reader.ReadAsync()) poId = reader["PoId"].ToString();
+                return Ok(new { succeeded = true, poId });
+            }
+            catch (SqlException sqlEx)
+            {
+                // business rules raised by the procedure (already decided, vendor no longer in Sage ...) come back as readable messages
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(409, new { Message = sqlEx.Message, Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while approving the PO.", Details = ex.Message });
+            }
+        }
+
+        /// <summary>Reject: marks the request Rejected (reason required) so it leaves the queue. Nothing is created in Sage.</summary>
+        [HttpPost("api/PoQueue/RejectPoRequest", Name = "RejectPoRequest")]
+        public async Task<IActionResult> RejectPoRequest([FromBody] PoApprovalActionDto request)
+        {
+            if (request == null || !int.TryParse(request.PoId, out var requestId)) return BadRequest(new { Message = "Invalid PO request id." });
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("PO_RejectRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", requestId);
+                command.Parameters.AddWithValue("@RejectedBy", (object)request.DecidedBy ?? DBNull.Value);
+                command.Parameters.AddWithValue("@Reason", (object)request.Reason ?? DBNull.Value);
+                await connection.OpenAsync();
+                await command.ExecuteNonQueryAsync();
+                return Ok(new { succeeded = true });
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(409, new { Message = sqlEx.Message, Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while rejecting the PO.", Details = ex.Message });
             }
         }
 
@@ -554,27 +738,19 @@ namespace StowellCoAPI.Controllers
         {
             try
             {
-                string connectionString = _configuration.GetConnectionString("SageSBQConnection");
-                using SqlConnection connection = new SqlConnection(connectionString);
-                SqlCommand command = new SqlCommand("PO_UpdatePo", connection) { CommandType = CommandType.StoredProcedure };
-                command.Parameters.AddWithValue("@PoId", poId);
-                command.Parameters.AddWithValue("@Vendor", (object)request.Vendor ?? DBNull.Value);
-                command.Parameters.AddWithValue("@PoDescription", (object)request.PoDescription ?? DBNull.Value);
-                // FIX (2026-09-14) - PO_UpdatePo's @Requester param feeds pchord.usrnme directly
-                // (no separate @CreatedBy param exists on this proc); sending request.CreatedBy
-                // (the real authenticated user) here instead of request.Requester (free text) so
-                // usrnme reflects who actually made the edit, matching Save/SubmitPoRequest's fix.
-                command.Parameters.AddWithValue("@Requester", (object)request.CreatedBy ?? DBNull.Value);
-                command.Parameters.AddWithValue("@DateRequested", ParseDateOrNull(request.DateRequested));
-                command.Parameters.AddWithValue("@RequiredOnSite", ParseDateOrNull(request.RequiredOnSite));
-                command.Parameters.AddWithValue("@ItemsJson", JsonSerializer.Serialize(request.Items ?? new(), CamelCase));
-                command.Parameters.AddWithValue("@BackChargesJson", JsonSerializer.Serialize(request.BackCharges ?? new(), CamelCase));
-                command.Parameters.AddWithValue("@PhaseNumber", (object)request.PhaseNumber ?? DBNull.Value);
+                // CHANGE (2026-10-04, "all should be through approval"): this used to run PO_UpdatePo, which rewrote the
+                // Sage PO (pchord/pcorln) on the spot. The edit is now saved as a Pending change request and Sage is only
+                // changed when Accounting approves it (Change_Approve runs PO_UpdatePo with these same values). The payload
+                // is the same request the old call used, so the approved edit is identical to what the PM entered.
+                var requestId = await ChangeRequestStore.RequestAsync(
+                    _configuration, ChangeRequestStore.Po, poId, "Edit",
+                    JsonSerializer.Serialize(request, CamelCase), request.CreatedBy);
 
-                await connection.OpenAsync();
-                await command.ExecuteNonQueryAsync();
-
-                return Ok(new { saved = true });
+                return Ok(new { saved = true, pendingApproval = true, requestId });
+            }
+            catch (SqlException sqlEx) when (ChangeRequestStore.IsUserFacing(sqlEx))
+            {
+                return Conflict(new { Message = sqlEx.Message });
             }
             catch (SqlException sqlEx)
             {

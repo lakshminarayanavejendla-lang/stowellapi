@@ -965,6 +965,19 @@ namespace StowellCoAPI.Controllers
                 await using var conn = new SqlConnection(connectionString);
                 await conn.OpenAsync();
 
+                // Mike Smith, 2026-09-26: once a project exists its contract amount cannot be changed from the form (accounting changes it
+                // in Sage100). The Edit Project page shows it read-only; this enforces the same rule here so a direct call cannot change it
+                // - the stored amount always wins. (No stored row = nothing to protect, so the submitted value is used.)
+                decimal? storedContractAmount = null;
+                await using (var cmd = new SqlCommand("SELECT ContractAmount FROM dbo.Bids WHERE JobID = @JobID", conn))
+                {
+                    cmd.Parameters.AddWithValue("@JobID", bid.JobID);
+                    var existing = await cmd.ExecuteScalarAsync();
+                    // locked only once an amount has been set - a project created without one can still have it entered
+                    if (existing != null && existing != DBNull.Value && Convert.ToDecimal(existing) > 0) storedContractAmount = Convert.ToDecimal(existing);
+                }
+                decimal contractAmountToSave = storedContractAmount ?? bid.ContractAmount ?? 0.0m;
+
                 // -------------------- Bids_Update --------------------
                 await using (var cmd = new SqlCommand("Bids_Update", conn))
                 {
@@ -980,7 +993,7 @@ namespace StowellCoAPI.Controllers
                     cmd.Parameters.AddWithValue("@ShortName", bid.ShortName);
                     cmd.Parameters.AddWithValue("@ContractNumber", bid.ContractNumber);
                     cmd.Parameters.AddWithValue("@ContractDate", !string.IsNullOrEmpty(bid.ContractDate) ? Convert.ToDateTime(bid.ContractDate) : "");
-                    cmd.Parameters.AddWithValue("@ContractAmount", bid.ContractAmount ?? 0.0m);
+                    cmd.Parameters.AddWithValue("@ContractAmount", contractAmountToSave);
                     cmd.Parameters.AddWithValue("@EstStartDate", !string.IsNullOrEmpty(bid.EstStartDate) ? Convert.ToDateTime(bid.EstStartDate) : "");
                     cmd.Parameters.AddWithValue("@EstCompletionDate", !string.IsNullOrEmpty(bid.EstCompletionDate) ? Convert.ToDateTime(bid.EstCompletionDate) : "");
                     await cmd.ExecuteNonQueryAsync();
@@ -1047,6 +1060,7 @@ namespace StowellCoAPI.Controllers
             }
             catch (Exception ex)
             {
+                _logger.LogError(ex, "UpdateBidData failed unexpectedly for job {JobId}", bid?.JobID);
                 return (false, $"Failed to update the project details.");
                 _logger.LogError(ex, ex.Message);
             }

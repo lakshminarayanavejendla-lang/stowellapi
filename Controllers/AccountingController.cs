@@ -71,7 +71,9 @@ namespace StowellCoAPI.Controllers
                 string cs = _configuration.GetConnectionString("SageSBQConnection");
                 using var conn = new SqlConnection(cs);
                 //string email = HttpContext.User.Identity.Name; //"p360admin@stowellinc.com"; //
-                using var cmd = new SqlCommand($"SELECT ID, JobID,JobName,JobType, BidDate, Address, Submitter, BidStatus,StatusID FROM {viewName} where Submitter = @email order by JobID", conn);
+                // Mike Smith, 2026-09-26: budgets waiting for Accounting's approval (StatusID 1 = new budget, 2 = budget for an added phase) are
+                // shown to Accounting whoever submitted them; the other rows (project onboarding) still show only the submitter's own.
+                using var cmd = new SqlCommand($"SELECT ID, JobID,JobName,JobType, BidDate, Address, Submitter, BidStatus,StatusID FROM {viewName} where Submitter = @email OR StatusID IN (1, 2) order by JobID", conn);
                 cmd.Parameters.AddWithValue("@email", email);
                 conn.Open();
                 using var reader = await cmd.ExecuteReaderAsync();

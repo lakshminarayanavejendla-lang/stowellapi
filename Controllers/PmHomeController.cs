@@ -48,9 +48,11 @@ namespace StowellCoAPI.Controllers
             // queries the same real actrec data Project Queue uses, unfiltered (matches Project
             // Queue's own behavior - no per-user job-access model exists against actrec yet).
             var records = new List<CurrentJob>();
+            // 2026-10-04: deliberately stays on the sandbox copy (StowellConnection), not StowellCompany, so a project won
+            // or created in the app shows here straight away. (Monthly Financials reads StowellCompany.)
             string connectionString = _configuration.GetConnectionString("StowellConnection");
 
-            string query = @"SELECT recnum, jobnme, ISNULL(addrs1,'') + ' ' + ISNULL(addrs2,'') AS Address
+            string query = @"SELECT recnum, jobnme, ISNULL(addrs1,'') + ' ' + ISNULL(addrs2,'') AS Address, status, pctcmp
                               FROM actrec ORDER BY recnum DESC";
             try
             {
@@ -68,7 +70,8 @@ namespace StowellCoAPI.Controllers
                                 JobName = reader["jobnme"]?.ToString() ?? string.Empty,
                                 Address = reader["Address"]?.ToString()?.Trim() ?? string.Empty,
                                 CreatedBy = string.Empty,
-                                Status = string.Empty
+                                Status = JobStatusName(reader["status"]),
+                                PercentComplete = reader["pctcmp"] == DBNull.Value ? 0m : Math.Clamp(Convert.ToDecimal(reader["pctcmp"]), 0m, 100m)
                             };
 
                             records.Add(record);
@@ -99,6 +102,22 @@ namespace StowellCoAPI.Controllers
                 _logger.LogError(ex, ex.Message);
             }
         }
+        /// <summary>Sage job status code (actrec.status) as the label used by the cash-flow status list (VwCashFlowStatus).</summary>
+        private static string JobStatusName(object code)
+        {
+            if (code == null || code == DBNull.Value) return string.Empty;
+            return Convert.ToInt32(code) switch
+            {
+                1 => "Bid",
+                2 => "Refused",
+                3 => "Contract",
+                4 => "Current",
+                5 => "Complete",
+                6 => "Closed",
+                _ => string.Empty
+            };
+        }
+
        [HttpGet("api/[controller]/GetNetCashChart", Name = "GetNetCashChart")]
         public async Task<IActionResult>  GetNetCashChart()
         {
@@ -399,6 +418,32 @@ namespace StowellCoAPI.Controllers
                     Details = ex.Message
                 });
                 _logger.LogError(ex, ex.Message);
+            }
+        }
+
+        /// <summary>Adds an event to the same shared calendar that GetCalendarEvents reads (EventsEmail).</summary>
+        [HttpPost("api/[controller]/CreateCalendarEvent", Name = "CreateCalendarEvent")]
+        public async Task<IActionResult> CreateCalendarEvent([FromBody] CreateCalendarEventRequest request)
+        {
+            if (request == null || string.IsNullOrWhiteSpace(request.Subject))
+                return BadRequest(new { Message = "A title is required." });
+            if (request.End <= request.Start)
+                return BadRequest(new { Message = "The end must be after the start." });
+
+            try
+            {
+                var created = await _calendarService.CreateEventAsync(_configuration["EventsEmail"], request.Subject.Trim(), request.Start, request.End, request.IsAllDay);
+                return Ok(created);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "CreateCalendarEvent failed");
+                // most likely the app registration lacks the Calendars.ReadWrite application permission
+                return StatusCode(502, new
+                {
+                    Message = "The event could not be saved to the calendar.",
+                    Details = ex.Message
+                });
             }
         }
     }

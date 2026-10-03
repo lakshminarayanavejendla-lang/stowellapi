@@ -76,6 +76,7 @@ builder.Services.AddHostedService<ApiCallLogWriter>();
 //builder.Services.AddAuthorization();
 
 builder.Services.AddControllers();
+builder.Services.AddMemoryCache();
 // CORS (allow Blazor UI domain)
 //builder.Services.AddCors(options =>
 //{

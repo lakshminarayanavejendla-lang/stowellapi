@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 using StowellCoAPI.DTO;
+using StowellCoAPI.Services;
 using System.Data;
 using System.Globalization;
 using System.Text.Json;
@@ -126,7 +127,10 @@ namespace StowellCoAPI.Controllers
             {
                 string connectionString = _configuration.GetConnectionString("SageSBQConnection");
                 using SqlConnection connection = new SqlConnection(connectionString);
-                SqlCommand command = new SqlCommand("CO_SubmitRequest", connection) { CommandType = CommandType.StoredProcedure };
+                // Mike Smith, 2026-09-26: a submitted CO now waits for Accounting approval instead of being created in Sage straight away
+                // (same as POs). CO_SubmitForApproval holds it (dbo.CoApprovalRequests); CO_ApproveRequest creates the Sage CO via
+                // CO_SubmitRequest; CO_RejectRequest drops it from the queue. Same parameters as CO_SubmitRequest.
+                SqlCommand command = new SqlCommand("CO_SubmitForApproval", connection) { CommandType = CommandType.StoredProcedure };
                 command.Parameters.AddWithValue("@JobId", long.TryParse(request.JobId, out var jobId) ? jobId : 0);
                 command.Parameters.AddWithValue("@PurchaseOrderId", (object)request.PurchaseOrderId ?? DBNull.Value);
                 command.Parameters.AddWithValue("@Vendor", (object)request.Vendor ?? DBNull.Value);
@@ -141,15 +145,14 @@ namespace StowellCoAPI.Controllers
 
                 await connection.OpenAsync();
                 using SqlDataReader reader = await command.ExecuteReaderAsync();
-                string coId = null;
-                long coRecNum = 0;
+                int requestId = 0;
                 if (await reader.ReadAsync())
                 {
-                    coId = reader["CoId"].ToString();
-                    coRecNum = Convert.ToInt64(reader["CoRecNum"]);
+                    requestId = Convert.ToInt32(reader["RequestId"]);
                 }
 
-                return Ok(new { submitted = true, coId, coRecNum });
+                // coId stays empty until Accounting approves the request (that is when the Sage CO number is assigned)
+                return Ok(new { submitted = true, requestId, status = "Pending Approval" });
             }
             catch (SqlException sqlEx)
             {
@@ -160,6 +163,186 @@ namespace StowellCoAPI.Controllers
             {
                 _logger.LogError(ex, ex.Message);
                 return StatusCode(500, new { Message = "An unexpected error occurred while submitting the CO request.", Details = ex.Message });
+            }
+        }
+
+        // ------------------------------------------------------------------------------------------------------------------------
+        // Accounting approval of submitted change orders (Mike Smith, 2026-09-26) - see db/co-approval-2026-09-26.sql. Approve -> the CO is
+        // created in Sage; reject -> marked rejected and removed from the queue.
+        // ------------------------------------------------------------------------------------------------------------------------
+
+        /// <summary>COs waiting for Accounting approval (the Accounting CO Queue).</summary>
+        [HttpGet("api/CoQueue/GetPendingCoApprovals", Name = "GetPendingCoApprovals")]
+        public async Task<IActionResult> GetPendingCoApprovals()
+        {
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("CO_GetPendingApprovals", connection) { CommandType = CommandType.StoredProcedure };
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+                var rows = new List<object>();
+                while (await reader.ReadAsync())
+                {
+                    rows.Add(new
+                    {
+                        requestId = Convert.ToInt32(reader["RequestId"]),
+                        jobId = reader["JobId"].ToString(),
+                        jobName = reader["JobName"] == DBNull.Value ? "" : reader["JobName"].ToString(),
+                        purchaseOrderId = reader["PurchaseOrderId"] == DBNull.Value ? "" : reader["PurchaseOrderId"].ToString(),
+                        vendor = reader["Vendor"] == DBNull.Value ? "" : reader["Vendor"].ToString(),
+                        coReason = reader["CoReason"].ToString(),
+                        requester = reader["Requester"] == DBNull.Value ? "" : reader["Requester"].ToString(),
+                        createdBy = reader["CreatedBy"] == DBNull.Value ? "" : reader["CreatedBy"].ToString(),
+                        totalAmount = Convert.ToDecimal(reader["TotalAmount"]),
+                        submittedDate = Convert.ToDateTime(reader["SubmittedDate"]).ToString("MM/dd/yyyy", System.Globalization.CultureInfo.InvariantCulture)
+                    });
+                }
+                return Ok(rows);
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(500, new { Message = "A database error occurred while retrieving the COs waiting for approval.", Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while retrieving the COs waiting for approval.", Details = ex.Message });
+            }
+        }
+
+        /// <summary>One request for the approval screen. {requestId} is the approval request id (shown as the CO id on the screen).</summary>
+        [HttpGet("api/CoQueue/GetCoRequestForApproval/{requestId}", Name = "GetCoRequestForApproval")]
+        public async Task<IActionResult> GetCoRequestForApproval(int requestId)
+        {
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("CO_GetApprovalRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", requestId);
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+
+                if (!await reader.ReadAsync()) return NotFound(new { Message = "CO request not found." });
+
+                var coId = reader["RequestId"].ToString();
+                var jobId = reader["JobId"].ToString();
+                var jobName = reader["JobName"] == DBNull.Value ? "" : reader["JobName"].ToString();
+                var purchaseOrderId = reader["PurchaseOrderId"] == DBNull.Value ? "" : reader["PurchaseOrderId"].ToString();
+                var requester = reader["Requester"] == DBNull.Value ? "" : reader["Requester"].ToString();
+                var vendor = reader["Vendor"] == DBNull.Value ? "" : reader["Vendor"].ToString();
+                var coReason = reader["CoReason"].ToString();
+                var dateRequested = reader["DateRequested"] == DBNull.Value ? "" : reader["DateRequested"].ToString();
+                var requiredOnSite = reader["RequiredOnSite"] == DBNull.Value ? "" : reader["RequiredOnSite"].ToString();
+                var totalCoAmount = Convert.ToDecimal(reader["TotalAmount"]);
+                var status = reader["Status"].ToString();
+
+                var items = new List<object>();
+                await reader.NextResultAsync();
+                while (await reader.ReadAsync())
+                {
+                    items.Add(new
+                    {
+                        item = reader["Item"] == DBNull.Value ? "" : reader["Item"].ToString(),
+                        remainingBudget = reader["RemainingBudget"] == DBNull.Value ? 0m : Convert.ToDecimal(reader["RemainingBudget"]),
+                        itemCost = reader["ItemCost"] == DBNull.Value ? 0m : Convert.ToDecimal(reader["ItemCost"]),
+                        itemNote = reader["ItemNote"] == DBNull.Value ? "" : reader["ItemNote"].ToString()
+                    });
+                }
+
+                var backCharges = new List<object>();
+                await reader.NextResultAsync();
+                while (await reader.ReadAsync())
+                {
+                    backCharges.Add(new
+                    {
+                        vendor = reader["Vendor"] == DBNull.Value ? "" : reader["Vendor"].ToString(),
+                        percentCharge = reader["PercentCharge"] == DBNull.Value ? (decimal?)null : Convert.ToDecimal(reader["PercentCharge"]),
+                        dollarCharge = Convert.ToDecimal(reader["DollarCharge"]),
+                        reason = reader["Reason"] == DBNull.Value ? "" : reader["Reason"].ToString()
+                    });
+                }
+
+                return Ok(new { coId, jobId, jobName, purchaseOrderId, requester, vendor, coReason, dateRequested, requiredOnSite, totalCoAmount, status, items, backCharges });
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(500, new { Message = "A database error occurred while retrieving the CO request.", Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while retrieving the CO request.", Details = ex.Message });
+            }
+        }
+
+        public class CoApprovalActionDto
+        {
+            /// <summary>the approval request id (the id shown as the CO id on the approval screen)</summary>
+            public string? CoId { get; set; }
+            /// <summary>required when rejecting; not sent when approving</summary>
+            public string? Reason { get; set; }
+            /// <summary>the signed-in Accounting user who decided</summary>
+            public string? DecidedBy { get; set; }
+        }
+
+        /// <summary>Approve: creates the CO in Sage and marks the request Approved.</summary>
+        [HttpPost("api/CoQueue/ApproveCoRequest", Name = "ApproveCoRequest")]
+        public async Task<IActionResult> ApproveCoRequest([FromBody] CoApprovalActionDto request)
+        {
+            if (request == null || !int.TryParse(request.CoId, out var requestId)) return BadRequest(new { Message = "Invalid CO request id." });
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("CO_ApproveRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", requestId);
+                command.Parameters.AddWithValue("@ApprovedBy", (object)request.DecidedBy ?? DBNull.Value);
+                await connection.OpenAsync();
+                using var reader = await command.ExecuteReaderAsync();
+                string coId = null;
+                if (await reader.ReadAsync()) coId = reader["CoId"].ToString();
+                return Ok(new { succeeded = true, coId });
+            }
+            catch (SqlException sqlEx)
+            {
+                // business rules raised by the procedure (already decided ...) come back as readable messages
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(409, new { Message = sqlEx.Message, Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while approving the CO.", Details = ex.Message });
+            }
+        }
+
+        /// <summary>Reject: marks the request Rejected (reason required) so it leaves the queue. Nothing is created in Sage.</summary>
+        [HttpPost("api/CoQueue/RejectCoRequest", Name = "RejectCoRequest")]
+        public async Task<IActionResult> RejectCoRequest([FromBody] CoApprovalActionDto request)
+        {
+            if (request == null || !int.TryParse(request.CoId, out var requestId)) return BadRequest(new { Message = "Invalid CO request id." });
+            try
+            {
+                using var connection = new SqlConnection(_configuration.GetConnectionString("SageSBQConnection"));
+                using var command = new SqlCommand("CO_RejectRequest", connection) { CommandType = CommandType.StoredProcedure };
+                command.Parameters.AddWithValue("@RequestId", requestId);
+                command.Parameters.AddWithValue("@RejectedBy", (object)request.DecidedBy ?? DBNull.Value);
+                command.Parameters.AddWithValue("@Reason", (object)request.Reason ?? DBNull.Value);
+                await connection.OpenAsync();
+                await command.ExecuteNonQueryAsync();
+                return Ok(new { succeeded = true });
+            }
+            catch (SqlException sqlEx)
+            {
+                _logger.LogError(sqlEx, sqlEx.Message);
+                return StatusCode(409, new { Message = sqlEx.Message, Details = sqlEx.Message });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, ex.Message);
+                return StatusCode(500, new { Message = "An unexpected error occurred while rejecting the CO.", Details = ex.Message });
             }
         }
 
@@ -360,26 +543,18 @@ namespace StowellCoAPI.Controllers
         {
             try
             {
-                string connectionString = _configuration.GetConnectionString("SageSBQConnection");
-                using SqlConnection connection = new SqlConnection(connectionString);
-                SqlCommand command = new SqlCommand("CO_UpdateCo", connection) { CommandType = CommandType.StoredProcedure };
-                command.Parameters.AddWithValue("@CoId", coId);
-                command.Parameters.AddWithValue("@PurchaseOrderId", (object)request.PurchaseOrderId ?? DBNull.Value);
-                command.Parameters.AddWithValue("@CoReason", (object)request.CoReason ?? DBNull.Value);
-                // FIX (2026-09-14) - CO_UpdateCo's @Requester param feeds prmchg.usrnme directly
-                // (no separate @CreatedBy param); sending request.CreatedBy (real authenticated
-                // user) instead of request.Requester (free text) - see PoQueueController.UpdatePo's
-                // matching comment.
-                command.Parameters.AddWithValue("@Requester", (object)request.CreatedBy ?? DBNull.Value);
-                command.Parameters.AddWithValue("@DateRequested", ParseDateOrNull(request.DateRequested));
-                command.Parameters.AddWithValue("@RequiredOnSite", ParseDateOrNull(request.RequiredOnSite));
-                command.Parameters.AddWithValue("@ItemsJson", JsonSerializer.Serialize(request.Items ?? new(), CamelCase));
-                command.Parameters.AddWithValue("@BackChargesJson", JsonSerializer.Serialize(request.BackCharges ?? new(), CamelCase));
+                // CHANGE (2026-10-04, "all should be through approval"): this used to run CO_UpdateCo, which rewrote the
+                // Sage change order (prmchg/sbcgln) on the spot. The edit is now saved as a Pending change request and Sage
+                // is only changed when Accounting approves it (Change_Approve runs CO_UpdateCo with these same values).
+                var requestId = await ChangeRequestStore.RequestAsync(
+                    _configuration, ChangeRequestStore.Co, coId, "Edit",
+                    JsonSerializer.Serialize(request, CamelCase), request.CreatedBy);
 
-                await connection.OpenAsync();
-                await command.ExecuteNonQueryAsync();
-
-                return Ok(new { saved = true });
+                return Ok(new { saved = true, pendingApproval = true, requestId });
+            }
+            catch (SqlException sqlEx) when (ChangeRequestStore.IsUserFacing(sqlEx))
+            {
+                return Conflict(new { Message = sqlEx.Message });
             }
             catch (SqlException sqlEx)
             {

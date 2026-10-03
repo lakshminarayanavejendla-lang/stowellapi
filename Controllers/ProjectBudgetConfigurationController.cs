@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.SqlClient;
 using Microsoft.Graph;
@@ -154,6 +154,36 @@ namespace StowellCoAPI.Controllers
             return costCodeSummaryRecords;
         }
 
+        // Mike Smith, 2026-09-26: "After initial budget is set, no one can change it - all changes come through Change Orders." The Budget
+        // Configuration page already shows a phase that has a budget as view-only; this enforces the same rule on the server so a direct call
+        // cannot change it either. A job/phase is locked as soon as Sage (bdglin) holds budget lines for it; a phase with none yet (a new
+        // job, or an added phase) can still have its initial budget created. Returns a message for the first locked job/phase, else null.
+        private async Task<string?> FindLockedBudgetAsync(IEnumerable<BudgetRecord?> records)
+        {
+            var pairs = records
+                .Where(r => r != null && !string.IsNullOrWhiteSpace(r.JobNumber))
+                .Select(r => new { Job = r!.JobNumber!, Phase = r.PhaseNum ?? 0 })
+                .Distinct()
+                .ToList();
+
+            string connectionString = _configuration.GetConnectionString("SageSBQConnection");
+            await using var conn = new SqlConnection(connectionString);
+            await conn.OpenAsync();
+            foreach (var p in pairs)
+            {
+                await using var cmd = new SqlCommand(
+                    "SELECT COUNT(1) FROM StowellSandbox.dbo.bdglin WHERE recnum = TRY_CAST(@job AS bigint) AND phsnum = @phase", conn);
+                cmd.Parameters.AddWithValue("@job", p.Job);
+                cmd.Parameters.AddWithValue("@phase", p.Phase);
+                if (Convert.ToInt32(await cmd.ExecuteScalarAsync()) > 0)
+                {
+                    string phaseText = p.Phase == 0 ? "None" : p.Phase.ToString();
+                    return $"The initial budget for job {p.Job}, phase {phaseText} is already set and can't be changed here. Budget changes are made through Change Orders.";
+                }
+            }
+            return null;
+        }
+
         [HttpPost("api/[controller]/SaveCreateBatchCostCodes", Name = "SaveCreateBatchCostCodes")]
         public async Task<ActionResult<IEnumerable<BudgetRecord>>> SaveCreateBatchCostCodes([FromBody] List<BudgetRecord> input)
         {
@@ -162,6 +192,12 @@ namespace StowellCoAPI.Controllers
                 if (input == null)
                 {
                     return BadRequest("Invalid input");
+                }
+
+                var lockedMessage = await FindLockedBudgetAsync(input);
+                if (lockedMessage != null)
+                {
+                    return Conflict(new { success = false, message = lockedMessage });
                 }
 
                 var savedRecords = new List<BudgetRecord>();
@@ -221,9 +257,31 @@ namespace StowellCoAPI.Controllers
                     cmd.Parameters.AddWithValue("@costcodedescription", input.CostCodeDescription ?? "");
                     cmd.Parameters.AddWithValue("@budget", input.ActionType== "CreateBudget" ? (input.TotalBudget ?? 0): (input.UpdateBudget ?? 0));
                     cmd.Parameters.AddWithValue("@PhaseNumber", input.PhaseNum ?? 0);
+                    // Mike Smith, 2026-09-26: the budget log showed a NULL phase name (phase 0 "None" in particular) because the name was never
+                    // passed - the procedures store whatever @PhaseName they receive.
+                    cmd.Parameters.AddWithValue("@PhaseName", (object?)await ResolvePhaseNameAsync(conn, input.JobNumber, input.PhaseNum ?? 0) ?? DBNull.Value);
                     await cmd.ExecuteNonQueryAsync();
                 }
             }
+        }
+
+        /// <summary>The job's name for a phase: Sage's phase list first, then phases added in the app (BidPhase); phase 0 is always "None".</summary>
+        private static async Task<string?> ResolvePhaseNameAsync(SqlConnection conn, string? jobNumber, decimal phase)
+        {
+            if (!string.IsNullOrWhiteSpace(jobNumber))
+            {
+                await using var cmd = new SqlCommand(
+                    @"SELECT TOP 1 name FROM (
+                          SELECT PhasesName AS name, 1 AS src FROM dbo.vwphases WHERE recnum = TRY_CAST(@job AS int) AND phsnum = @phase
+                          UNION ALL
+                          SELECT Description, 2 FROM dbo.BidPhase WHERE JobID = @job AND TRY_CAST(Phase AS int) = @phase AND COALESCE(IsDeleted, 0) = 0
+                      ) x WHERE name IS NOT NULL AND LTRIM(RTRIM(name)) <> '' ORDER BY src", conn);
+                cmd.Parameters.AddWithValue("@job", jobNumber);
+                cmd.Parameters.AddWithValue("@phase", phase);
+                var found = await cmd.ExecuteScalarAsync();
+                if (found != null && found != DBNull.Value) return Convert.ToString(found);
+            }
+            return phase == 0 ? "None" : $"Phase {phase:0}";
         }
 
         [HttpPost("api/[controller]/SubmitBatchCostCodes", Name = "SubmitBatchCostCodes")]
@@ -235,6 +293,13 @@ namespace StowellCoAPI.Controllers
                 {
                     return BadRequest(new { success = false, message = "Invalid input" });
                 }
+
+                var lockedMessage = await FindLockedBudgetAsync(input);
+                if (lockedMessage != null)
+                {
+                    return Conflict(new { success = false, message = lockedMessage });
+                }
+
                 var savedRecords = new List<BudgetRecord>();
                 foreach (var item in input)
                 {
@@ -242,61 +307,10 @@ namespace StowellCoAPI.Controllers
                     savedRecords.Add(item);
                 }
 
-                // TEMP (2026-09-16, Mike Smith - demo request): auto-approve straight to Sage
-                // (dbo.bdglin, via sp_ApproveBudgetTransaction) instead of leaving these rows
-                // pending in BudgetTransactions. Prod flow requires a separate Accounting ->
-                // Approve Budget step (matches the Blazor original - not a bug); Mike confirmed
-                // that's correct for Prod but wants it skipped for this demo so Initial Budget
-                // shows up in Budget/PO/CO/Invoices immediately, and said the real approval
-                // workflow (who approves what) will be revisited after he confirms requirements
-                // with Sheena. REMOVE this auto-approve block once that real workflow is defined.
-                var jobPhasePairs = input
-                    .Where(i => i != null)
-                    .Select(i => new { JobID = i.JobNumber, PhaseNumber = i.PhaseNum ?? 0, ApprovedBy = i.Email })
-                    .Distinct()
-                    .ToList();
-
-                // FIX (2026-09-16) - was ExecuteNonQueryAsync(), discarding sp_ApproveBudgetTransaction's
-                // own result set the same way BudgetApproveRequest used to (see that action's matching
-                // fix comment). That proc catches errors from EXEC sp_BudgetTran internally (e.g. an
-                // unresolvable cost code, or - the actual case that bit this exact flow - an approver
-                // email with no matching StowellUsers row) and returns them as a SELECT
-                // (ErrorMessage/RowsAffected) instead of raising a .NET exception, so failures here were
-                // silently swallowed: the endpoint still returned 200/savedRecords even though nothing
-                // was posted to Sage. Now reads that result set and reports real per-job/phase failures.
-                var approveErrors = new List<string>();
-                string connectionString = _configuration.GetConnectionString("SageSBQConnection");
-                using (var conn = new SqlConnection(connectionString))
-                {
-                    await conn.OpenAsync();
-                    foreach (var jp in jobPhasePairs)
-                    {
-                        using var cmd = new SqlCommand("dbo.sp_ApproveBudgetTransaction", conn);
-                        cmd.CommandType = CommandType.StoredProcedure;
-                        cmd.Parameters.AddWithValue("@JobID", jp.JobID);
-                        cmd.Parameters.AddWithValue("@BudgetApprovedBy", (object?)jp.ApprovedBy ?? DBNull.Value);
-                        cmd.Parameters.AddWithValue("@Phasenum", jp.PhaseNumber);
-
-                        using var reader = await cmd.ExecuteReaderAsync();
-                        if (await reader.ReadAsync())
-                        {
-                            int errOrdinal;
-                            try { errOrdinal = reader.GetOrdinal("ErrorMessage"); }
-                            catch (IndexOutOfRangeException) { errOrdinal = -1; }
-
-                            if (errOrdinal >= 0 && !reader.IsDBNull(errOrdinal))
-                            {
-                                approveErrors.Add($"Job {jp.JobID}: {reader.GetString(errOrdinal)}");
-                            }
-                        }
-                    }
-                }
-
-                if (approveErrors.Count > 0)
-                {
-                    _logger.LogError("SubmitBatchCostCodes auto-approve failed: {Errors}", string.Join("; ", approveErrors));
-                    return StatusCode(500, new { success = false, message = "Saved, but failed to post to Sage: " + string.Join("; ", approveErrors) });
-                }
+                // Mike Smith, 2026-09-26: the temporary demo auto-approve that used to post straight to Sage here is REMOVED. A submitted
+                // initial budget now waits in the Accounting Queue (BudgetTransactions, not approved / not rejected) until Accounting approves it
+                // (AccountingController.BudgetApproveRequest -> sp_ApproveBudgetTransaction, which posts to Sage) or rejects it
+                // (BudgetRejectRequest -> sp_RejectBudgetTransaction, which takes it out of the queue).
 
                 return Ok(savedRecords);
             }
